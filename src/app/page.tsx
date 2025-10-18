@@ -104,11 +104,12 @@ function buildSeries(txs: Tx[], frame: Frame) {
     const c = new Date(cursor);
     if (frame === "month") c.setMonth(c.getMonth() + 1);
     else if (frame === "year") c.setFullYear(c.getFullYear() + 1);
-    else cursor +=
-      frame === "hour" ? 3600_000 :
-      frame === "day" ? 86_400_000 :
-      frame === "week" ? 7 * 86_400_000 :
-      30 * 86_400_000; // month fallback (unused here)
+    else
+      cursor +=
+        frame === "hour" ? 3600_000 :
+        frame === "day" ? 86_400_000 :
+        frame === "week" ? 7 * 86_400_000 :
+        30 * 86_400_000; // month fallback (unused here)
     if (frame === "month" || frame === "year") cursor = c.getTime();
     safety++;
   }
@@ -147,14 +148,27 @@ export default function FinanceTracker() {
   const [amount, setAmount] = useState<string>("");
   const inputRef = useRef<HTMLInputElement | null>(null);
 
+  // Stráž proti přepsání serveru prázdným polem
+  const loadedRef = useRef(false);
+
   // load once from server
   useEffect(() => {
-    loadTxServer().then(setTx);
+    loadTxServer().then((data) => {
+      setTx(data);
+      loadedRef.current = true; // až teď povolíme ukládání
+    });
   }, []);
 
-  // save to server whenever tx changes
+  // save to server whenever tx changes (debounced)
   useEffect(() => {
-    saveTxServer(tx);
+    if (!loadedRef.current) return; // neukládej, dokud nejsme po načtení
+    const id = setTimeout(() => {
+      saveTxServer(tx).catch((e) => {
+        // eslint-disable-next-line no-console
+        console.warn("saveTxServer failed", e);
+      });
+    }, 250); // debounce
+    return () => clearTimeout(id);
   }, [tx]);
 
   const balance = useMemo(() => round2(tx.reduce((a, b) => a + b.amount, 0)), [tx]);
@@ -316,7 +330,7 @@ export default function FinanceTracker() {
               </button>
               <button
                 onClick={() => addTransaction(-1)}
-                className="rounded-xl bg-rose-600 px-5 py-3 font-medium text-white shadow hover:brightness-105 active:scale-[.99]"
+                className="rounded-XL bg-rose-600 px-5 py-3 font-medium text-white shadow hover:brightness-105 active:scale-[.99]"
               >
                 − Odečíst
               </button>
