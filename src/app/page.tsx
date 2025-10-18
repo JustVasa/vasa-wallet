@@ -12,7 +12,7 @@ import {
 } from "recharts";
 
 // --- Types
-type Tx = { id: string; amount: number; ts: number };
+type Tx = { id: string; amount: number; ts: number; desc?: string };
 type Frame = "hour" | "day" | "week" | "month" | "year";
 
 // --- Helpers
@@ -111,15 +111,11 @@ function buildSeries(txs: Tx[], frame: Frame) {
 async function loadTxServer(): Promise<Tx[]> {
   try {
     const res = await fetch("/api/tx", { cache: "no-store" });
-    if (!res.ok) {
-      console.warn("GET /api/tx not ok:", res.status);
-      return [];
-    }
+    if (!res.ok) return [];
     const json = await res.json();
     const arr = Array.isArray(json?.tx) ? json.tx : [];
     return arr.filter(isTx);
-  } catch (e) {
-    console.warn("GET /api/tx failed:", e);
+  } catch {
     return [];
   }
 }
@@ -132,9 +128,11 @@ async function saveTxServer(list: Tx[]) {
       body: JSON.stringify({ tx: list }),
     });
     if (!res.ok) {
+      // eslint-disable-next-line no-console
       console.warn("POST /api/tx not ok:", res.status, await res.text());
     }
   } catch (e) {
+    // eslint-disable-next-line no-console
     console.warn("POST /api/tx failed:", e);
   }
 }
@@ -143,6 +141,7 @@ export default function FinanceTracker() {
   const [frame, setFrame] = useState<Frame>("month");
   const [tx, setTx] = useState<Tx[]>([]);
   const [amount, setAmount] = useState<string>("");
+  const [desc, setDesc] = useState<string>(""); // 👈 nový popisek
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   // Stráže/debounce
@@ -172,17 +171,19 @@ export default function FinanceTracker() {
   const balance = useMemo(() => round2(tx.reduce((a, b) => a + b.amount, 0)), [tx]);
   const series = useMemo(() => buildSeries(tx, frame), [tx, frame]);
 
-  // Okamžitý zápis při akci (aby se nezahladilo refreshí)
+  // Okamžitý zápis při akci
   function addTransaction(sign: 1 | -1) {
     const val = parseFloat(amount.replace(",", "."));
     if (!Number.isFinite(val) || val === 0) return;
-    const newTx: Tx = { id: uid(), amount: round2(sign * val), ts: Date.now() };
+    const d = desc.trim();
+    const newTx: Tx = { id: uid(), amount: round2(sign * val), ts: Date.now(), desc: d || undefined };
     setTx((prev) => {
       const next = [...prev, newTx];
       if (loadedRef.current) saveTxServer(next);
       return next;
     });
     setAmount("");
+    setDesc("");
     inputRef.current?.focus();
   }
 
@@ -332,6 +333,13 @@ export default function FinanceTracker() {
               }}
               className="w-full rounded-xl border border-gray-300 bg-white px-4 py-3 shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 sm:max-w-xs"
             />
+            <input
+              type="text"
+              placeholder="Popisek (např. Oběd, Benzín...)"
+              value={desc}
+              onChange={(e) => setDesc(e.target.value.slice(0, 120))}
+              className="w-full rounded-xl border border-gray-300 bg-white px-4 py-3 shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 sm:max-w-sm"
+            />
             <div className="flex gap-2">
               <button
                 onClick={() => addTransaction(1)}
@@ -356,12 +364,17 @@ export default function FinanceTracker() {
                 .sort((a, b) => b.ts - a.ts)
                 .slice(0, 10)
                 .map((t) => (
-                  <li key={t.id} className="flex items-center justify-between px-4 py-3">
-                    <span className="text-sm text-gray-600">{new Date(t.ts).toLocaleString("cs-CZ")}</span>
-                    <span className={`font-medium ${t.amount >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                  <li key={t.id} className="flex items-center justify-between gap-4 px-4 py-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm text-gray-800">
+                        {t.desc ? t.desc : <span className="italic text-gray-500">Bez popisku</span>}
+                      </div>
+                      <div className="text-xs text-gray-500">{new Date(t.ts).toLocaleString("cs-CZ")}</div>
+                    </div>
+                    <div className={`shrink-0 font-medium ${t.amount >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
                       {t.amount >= 0 ? "+" : ""}
                       {t.amount.toLocaleString("cs-CZ", { style: "currency", currency: "CZK" })}
-                    </span>
+                    </div>
                   </li>
                 ))}
             </ul>
