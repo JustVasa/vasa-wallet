@@ -1,6 +1,5 @@
 "use client";
 
-
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   LineChart,
@@ -13,12 +12,17 @@ import {
 } from "recharts";
 
 // --- Types
- type Tx = { id: string; amount: number; ts: number };
- type Frame = "hour" | "day" | "week" | "month" | "year";
+type Tx = { id: string; amount: number; ts: number };
+type Frame = "hour" | "day" | "week" | "month" | "year";
 
 // --- Helpers
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function isTx(x: unknown): x is Tx {
+  const t = x as Partial<Tx>;
+  return typeof t?.id === "string" && Number.isFinite(t?.amount) && Number.isFinite(t?.ts);
 }
 
 function startOfFrame(date: Date, frame: Frame) {
@@ -64,23 +68,6 @@ function formatTick(ts: number, frame: Frame) {
   return fmt.format(d);
 }
 
-function loadTx(): Tx[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = localStorage.getItem("finance_tx_v1");
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as Tx[];
-    return parsed.filter((t) => Number.isFinite(t.amount) && Number.isFinite(t.ts));
-  } catch {
-    return [];
-  }
-}
-
-function saveTx(list: Tx[]) {
-  if (typeof window === "undefined") return;
-  localStorage.setItem("finance_tx_v1", JSON.stringify(list));
-}
-
 function round2(n: number) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
 }
@@ -103,14 +90,6 @@ function buildSeries(txs: Tx[], frame: Frame) {
   const keys = [...bucket.keys()].sort((a, b) => a - b);
   if (keys.length === 0) return [];
 
-  const stepMs: Record<Frame, number> = {
-    hour: 3600_000,
-    day: 86_400_000,
-    week: 7 * 86_400_000,
-    month: 30 * 86_400_000, // approximate for spacing; ticks show real month names
-    year: 365 * 86_400_000,
-  };
-
   const series: { ts: number; balance: number }[] = [];
   let cursor = keys[0];
   const end = startOfFrame(new Date(), frame).getTime();
@@ -125,13 +104,41 @@ function buildSeries(txs: Tx[], frame: Frame) {
     const c = new Date(cursor);
     if (frame === "month") c.setMonth(c.getMonth() + 1);
     else if (frame === "year") c.setFullYear(c.getFullYear() + 1);
-    else cursor += stepMs[frame];
-
+    else cursor +=
+      frame === "hour" ? 3600_000 :
+      frame === "day" ? 86_400_000 :
+      frame === "week" ? 7 * 86_400_000 :
+      30 * 86_400_000; // month fallback (unused here)
     if (frame === "month" || frame === "year") cursor = c.getTime();
     safety++;
   }
 
   return series;
+}
+
+// --- Server persistence (API) ---
+async function loadTxServer(): Promise<Tx[]> {
+  try {
+    const res = await fetch("/api/tx", { cache: "no-store" });
+    if (!res.ok) return [];
+    const json = await res.json();
+    const arr = Array.isArray(json?.tx) ? json.tx : [];
+    return arr.filter(isTx);
+  } catch {
+    return [];
+  }
+}
+
+async function saveTxServer(list: Tx[]) {
+  try {
+    await fetch("/api/tx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tx: list }),
+    });
+  } catch {
+    // noop – můžeš sem dát toast
+  }
 }
 
 export default function FinanceTracker() {
@@ -140,13 +147,14 @@ export default function FinanceTracker() {
   const [amount, setAmount] = useState<string>("");
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  // load once
+  // load once from server
   useEffect(() => {
-    setTx(loadTx());
+    loadTxServer().then(setTx);
   }, []);
 
+  // save to server whenever tx changes
   useEffect(() => {
-    saveTx(tx);
+    saveTxServer(tx);
   }, [tx]);
 
   const balance = useMemo(() => round2(tx.reduce((a, b) => a + b.amount, 0)), [tx]);
@@ -170,7 +178,7 @@ export default function FinanceTracker() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `finance-${new Date().toISOString().slice(0,10)}.json`;
+    a.download = `finance-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -181,11 +189,9 @@ export default function FinanceTracker() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const parsed = JSON.parse(String(reader.result)) as Tx[];
+        const parsed = JSON.parse(String(reader.result)) as unknown;
         if (!Array.isArray(parsed)) throw new Error("Invalid file");
-        const cleaned = parsed
-          .filter((t) => typeof t.amount === "number" && typeof t.ts === "number")
-          .map((t) => ({ id: t.id ?? uid(), amount: round2(t.amount), ts: t.ts }));
+        const cleaned = parsed.filter(isTx);
         setTx(cleaned);
       } catch {
         alert("Soubor není platný JSON export.");
@@ -238,7 +244,7 @@ export default function FinanceTracker() {
           <div className="rounded-2xl bg-white p-4 shadow">
             <div className="text-sm text-gray-500">Zůstatek</div>
             <div className={`mt-1 text-2xl font-semibold ${balance >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-              {balance.toLocaleString('cs-CZ', { style: "currency", currency: "CZK", maximumFractionDigits: 2 })}
+              {balance.toLocaleString("cs-CZ", { style: "currency", currency: "CZK", maximumFractionDigits: 2 })}
             </div>
           </div>
           <div className="rounded-2xl bg-white p-4 shadow">
@@ -267,18 +273,16 @@ export default function FinanceTracker() {
                   domain={["dataMin", "dataMax"]}
                   type="number"
                 />
-                <YAxis
-                  tickFormatter={(v) => v.toLocaleString('cs-CZ', { maximumFractionDigits: 0 })}
-                />
+                <YAxis tickFormatter={(v) => v.toLocaleString("cs-CZ", { maximumFractionDigits: 0 })} />
                 <Tooltip
-                  labelFormatter={(v) => new Date(Number(v)).toLocaleString('cs-CZ')}
+                  labelFormatter={(v) => new Date(Number(v)).toLocaleString("cs-CZ")}
                   formatter={(value: unknown) => [
-                    Number(value).toLocaleString('cs-CZ', {
-                      style: 'currency',
-                      currency: 'CZK',
+                    Number(value).toLocaleString("cs-CZ", {
+                      style: "currency",
+                      currency: "CZK",
                       maximumFractionDigits: 2,
                     }),
-                    'Zůstatek',
+                    "Zůstatek",
                   ]}
                 />
                 <Line type="monotone" dataKey="balance" dot={false} strokeWidth={2} />
@@ -328,10 +332,10 @@ export default function FinanceTracker() {
                 .slice(0, 10)
                 .map((t) => (
                   <li key={t.id} className="flex items-center justify-between px-4 py-3">
-                    <span className="text-sm text-gray-600">{new Date(t.ts).toLocaleString()}</span>
+                    <span className="text-sm text-gray-600">{new Date(t.ts).toLocaleString("cs-CZ")}</span>
                     <span className={`font-medium ${t.amount >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
                       {t.amount >= 0 ? "+" : ""}
-                      {t.amount.toLocaleString(undefined, { style: "currency", currency: "CZK" })}
+                      {t.amount.toLocaleString("cs-CZ", { style: "currency", currency: "CZK" })}
                     </span>
                   </li>
                 ))}
@@ -341,7 +345,7 @@ export default function FinanceTracker() {
 
         {/* Footer */}
         <footer className="mt-10 text-center text-xs text-gray-500">
-          Data se ukládají jen do vašeho prohlížeče (localStorage). Pro zálohu použijte Export/Import.
+          Data se ukládají na server (Upstash Redis) a sdílejí mezi zařízeními. Export/Import JSON je k dispozici pro zálohu.
         </footer>
       </div>
     </div>
