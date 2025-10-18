@@ -1,103 +1,339 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from "recharts";
+
+// --- Types
+ type Tx = { id: string; amount: number; ts: number };
+ type Frame = "hour" | "day" | "week" | "month" | "year";
+
+// --- Helpers
+function uid() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function startOfFrame(date: Date, frame: Frame) {
+  const d = new Date(date);
+  if (frame === "hour") d.setMinutes(0, 0, 0);
+  if (frame === "day") d.setHours(0, 0, 0, 0);
+  if (frame === "week") {
+    // ISO week: Monday start
+    const day = (d.getDay() + 6) % 7; // 0..6 (Mon..Sun)
+    d.setDate(d.getDate() - day);
+    d.setHours(0, 0, 0, 0);
+  }
+  if (frame === "month") {
+    d.setDate(1);
+    d.setHours(0, 0, 0, 0);
+  }
+  if (frame === "year") {
+    d.setMonth(0, 1);
+    d.setHours(0, 0, 0, 0);
+  }
+  return d;
+}
+
+function formatTick(ts: number, frame: Frame) {
+  const d = new Date(ts);
+  const fmt = new Intl.DateTimeFormat('cs-CZ', {
+    ...(frame === "hour" && { hour: "2-digit", day: "2-digit", month: "2-digit" }),
+    ...(frame === "day" && { day: "2-digit", month: "2-digit" }),
+    ...(frame === "week" && { day: "2-digit", month: "2-digit" }),
+    ...(frame === "month" && { month: "short", year: "numeric" }),
+    ...(frame === "year" && { year: "numeric" }),
+  } as any);
+  return fmt.format(d);
+}
+
+function loadTx(): Tx[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem("finance_tx_v1");
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as Tx[];
+    return parsed.filter((t) => Number.isFinite(t.amount) && Number.isFinite(t.ts));
+  } catch {
+    return [];
+  }
+}
+
+function saveTx(list: Tx[]) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem("finance_tx_v1", JSON.stringify(list));
+}
+
+function round2(n: number) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+// Group transactions into frames and compute cumulative balance per bucket
+function buildSeries(txs: Tx[], frame: Frame) {
+  if (txs.length === 0) return [] as { ts: number; balance: number }[];
+
+  // sort by time asc
+  const sorted = [...txs].sort((a, b) => a.ts - b.ts);
+
+  // Map bucket start timestamp -> sum of amounts in that bucket
+  const bucket = new Map<number, number>();
+  for (const t of sorted) {
+    const key = startOfFrame(new Date(t.ts), frame).getTime();
+    bucket.set(key, (bucket.get(key) ?? 0) + t.amount);
+  }
+
+  // Build cumulative series from earliest bucket to latest, filling gaps
+  const keys = [...bucket.keys()].sort((a, b) => a - b);
+  if (keys.length === 0) return [];
+
+  const stepMs: Record<Frame, number> = {
+    hour: 3600_000,
+    day: 86_400_000,
+    week: 7 * 86_400_000,
+    month: 30 * 86_400_000, // approximate for spacing; ticks show real month names
+    year: 365 * 86_400_000,
+  };
+
+  const series: { ts: number; balance: number }[] = [];
+  let cursor = keys[0];
+  let end = startOfFrame(new Date(), frame).getTime();
+  let accum = 0;
+  let safety = 0; // avoid infinite loops if clocks are weird
+
+  while (cursor <= end && safety < 100000) {
+    accum = round2(accum + (bucket.get(cursor) ?? 0));
+    series.push({ ts: cursor, balance: accum });
+
+    // advance cursor by frame
+    const c = new Date(cursor);
+    if (frame === "month") c.setMonth(c.getMonth() + 1);
+    else if (frame === "year") c.setFullYear(c.getFullYear() + 1);
+    else cursor += stepMs[frame];
+
+    if (frame === "month" || frame === "year") cursor = c.getTime();
+    safety++;
+  }
+
+  return series;
+}
+
+export default function FinanceTracker() {
+  const [frame, setFrame] = useState<Frame>("month");
+  const [tx, setTx] = useState<Tx[]>([]);
+  const [amount, setAmount] = useState<string>("");
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // load once
+  useEffect(() => {
+    setTx(loadTx());
+  }, []);
+
+  useEffect(() => {
+    saveTx(tx);
+  }, [tx]);
+
+  const balance = useMemo(() => round2(tx.reduce((a, b) => a + b.amount, 0)), [tx]);
+  const series = useMemo(() => buildSeries(tx, frame), [tx, frame]);
+
+  function addTransaction(sign: 1 | -1) {
+    const val = parseFloat(amount.replace(",", "."));
+    if (!Number.isFinite(val) || val === 0) return;
+    const newTx: Tx = { id: uid(), amount: round2(sign * val), ts: Date.now() };
+    setTx((prev) => [...prev, newTx]);
+    setAmount("");
+    inputRef.current?.focus();
+  }
+
+  function resetAll() {
+    if (confirm("Smazat všechny položky?")) setTx([]);
+  }
+
+  function exportJson() {
+    const blob = new Blob([JSON.stringify(tx, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `finance-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importJson(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result)) as Tx[];
+        if (!Array.isArray(parsed)) throw new Error("Invalid file");
+        const cleaned = parsed
+          .filter((t) => typeof t.amount === "number" && typeof t.ts === "number")
+          .map((t) => ({ id: t.id ?? uid(), amount: round2(t.amount), ts: t.ts }));
+        setTx(cleaned);
+      } catch {
+        alert("Soubor není platný JSON export.");
+      }
+    };
+    reader.readAsText(file);
+  }
+
   return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <div className="min-h-screen w-full bg-gray-50 text-gray-900 antialiased">
+      <div className="mx-auto max-w-5xl px-4 py-8">
+        {/* Header */}
+        <header className="mb-6 flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
+          <h1 className="text-2xl font-bold tracking-tight">💸 Finance Tracker</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="text-sm text-gray-600">Časová osa:</label>
+            <select
+              value={frame}
+              onChange={(e) => setFrame(e.target.value as Frame)}
+              className="rounded-xl border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            >
+              <option value="hour">Hodiny</option>
+              <option value="day">Dny</option>
+              <option value="week">Týdny</option>
+              <option value="month">Měsíce</option>
+              <option value="year">Roky</option>
+            </select>
+            <button
+              onClick={resetAll}
+              className="rounded-xl border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-gray-100"
+              title="Smazat vše"
+            >
+              Reset
+            </button>
+            <button
+              onClick={exportJson}
+              className="rounded-xl border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-gray-100"
+            >
+              Export
+            </button>
+            <label className="cursor-pointer rounded-xl border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-gray-100">
+              Import
+              <input type="file" accept="application/json" className="hidden" onChange={importJson} />
+            </label>
+          </div>
+        </header>
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
+        {/* KPI Cards */}
+        <section className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <div className="rounded-2xl bg-white p-4 shadow">
+            <div className="text-sm text-gray-500">Zůstatek</div>
+            <div className={`mt-1 text-2xl font-semibold ${balance >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+              {balance.toLocaleString('cs-CZ', { style: "currency", currency: "CZK", maximumFractionDigits: 2 })}
+            </div>
+          </div>
+          <div className="rounded-2xl bg-white p-4 shadow">
+            <div className="text-sm text-gray-500">Položek celkem</div>
+            <div className="mt-1 text-2xl font-semibold">{tx.length}</div>
+          </div>
+          <div className="rounded-2xl bg-white p-4 shadow">
+            <div className="text-sm text-gray-500">Zobrazený rámec</div>
+            <div className="mt-1 text-2xl font-semibold capitalize">{frame}</div>
+          </div>
+        </section>
+
+        {/* Chart */}
+        <section className="rounded-2xl bg-white p-4 shadow">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-lg font-semibold">Vývoj zůstatku v čase</h2>
+            <p className="text-sm text-gray-500">Cumulative P&L</p>
+          </div>
+          <div className="h-72 w-full">
+            <ResponsiveContainer>
+              <LineChart data={series} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="ts"
+                  tickFormatter={(v) => formatTick(v as number, frame)}
+                  domain={["dataMin", "dataMax"]}
+                  type="number"
+                />
+                <YAxis
+                  tickFormatter={(v) => v.toLocaleString('cs-CZ', { maximumFractionDigits: 0 })}
+                />
+                <Tooltip
+                  labelFormatter={(v) => new Date(Number(v)).toLocaleString('cs-CZ')}
+                  formatter={(v: any) => [
+                    (v as number).toLocaleString(undefined, {
+                      style: "currency",
+                      currency: "CZK",
+                      maximumFractionDigits: 2,
+                    }),
+                    "Zůstatek",
+                  ]}
+                />
+                <Line type="monotone" dataKey="balance" dot={false} strokeWidth={2} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </section>
+
+        {/* Input / Controls */}
+        <section className="mt-6 rounded-2xl bg-white p-4 shadow">
+          <h3 className="mb-3 text-lg font-semibold">Nová položka</h3>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+            <input
+              ref={inputRef}
+              type="text"
+              inputMode="decimal"
+              placeholder="Částka (např. 2500 nebo -300)"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") addTransaction(1);
+              }}
+              className="w-full rounded-xl border border-gray-300 bg-white px-4 py-3 shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 sm:max-w-xs"
             />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
-        </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+            <div className="flex gap-2">
+              <button
+                onClick={() => addTransaction(1)}
+                className="rounded-xl bg-emerald-600 px-5 py-3 font-medium text-white shadow hover:brightness-105 active:scale-[.99]"
+              >
+                + Přičíst
+              </button>
+              <button
+                onClick={() => addTransaction(-1)}
+                className="rounded-xl bg-rose-600 px-5 py-3 font-medium text-white shadow hover:brightness-105 active:scale-[.99]"
+              >
+                − Odečíst
+              </button>
+            </div>
+          </div>
+
+          {/* Recent list */}
+          <div className="mt-6">
+            <h4 className="mb-2 text-sm font-semibold text-gray-700">Poslední položky</h4>
+            <ul className="divide-y divide-gray-100 rounded-2xl border border-gray-100 bg-gray-50">
+              {[...tx]
+                .sort((a, b) => b.ts - a.ts)
+                .slice(0, 10)
+                .map((t) => (
+                  <li key={t.id} className="flex items-center justify-between px-4 py-3">
+                    <span className="text-sm text-gray-600">{new Date(t.ts).toLocaleString()}</span>
+                    <span className={`font-medium ${t.amount >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                      {t.amount >= 0 ? "+" : ""}
+                      {t.amount.toLocaleString(undefined, { style: "currency", currency: "CZK" })}
+                    </span>
+                  </li>
+                ))}
+            </ul>
+          </div>
+        </section>
+
+        {/* Footer */}
+        <footer className="mt-10 text-center text-xs text-gray-500">
+          Data se ukládají jen do vašeho prohlížeče (localStorage). Pro zálohu použijte Export/Import.
+        </footer>
+      </div>
     </div>
   );
 }
