@@ -44,13 +44,23 @@ function startOfFrame(date: Date, frame: Frame) {
 
 function formatTick(ts: number, frame: Frame) {
   const d = new Date(ts);
-  const fmt = new Intl.DateTimeFormat('cs-CZ', {
-    ...(frame === "hour" && { hour: "2-digit", day: "2-digit", month: "2-digit" }),
-    ...(frame === "day" && { day: "2-digit", month: "2-digit" }),
-    ...(frame === "week" && { day: "2-digit", month: "2-digit" }),
-    ...(frame === "month" && { month: "short", year: "numeric" }),
-    ...(frame === "year" && { year: "numeric" }),
-  } as any);
+  let options: Intl.DateTimeFormatOptions;
+  switch (frame) {
+    case "hour":
+      options = { hour: "2-digit", day: "2-digit", month: "2-digit" };
+      break;
+    case "day":
+    case "week":
+      options = { day: "2-digit", month: "2-digit" };
+      break;
+    case "month":
+      options = { month: "short", year: "numeric" };
+      break;
+    case "year":
+    default:
+      options = { year: "numeric" };
+  }
+  const fmt = new Intl.DateTimeFormat("cs-CZ", options);
   return fmt.format(d);
 }
 
@@ -103,7 +113,7 @@ function buildSeries(txs: Tx[], frame: Frame) {
 
   const series: { ts: number; balance: number }[] = [];
   let cursor = keys[0];
-  let end = startOfFrame(new Date(), frame).getTime();
+  const end = startOfFrame(new Date(), frame).getTime();
   let accum = 0;
   let safety = 0; // avoid infinite loops if clocks are weird
 
@@ -262,13 +272,13 @@ export default function FinanceTracker() {
                 />
                 <Tooltip
                   labelFormatter={(v) => new Date(Number(v)).toLocaleString('cs-CZ')}
-                  formatter={(v: any) => [
-                    (v as number).toLocaleString(undefined, {
-                      style: "currency",
-                      currency: "CZK",
+                  formatter={(value: unknown) => [
+                    Number(value).toLocaleString('cs-CZ', {
+                      style: 'currency',
+                      currency: 'CZK',
                       maximumFractionDigits: 2,
                     }),
-                    "Zůstatek",
+                    'Zůstatek',
                   ]}
                 />
                 <Line type="monotone" dataKey="balance" dot={false} strokeWidth={2} />
