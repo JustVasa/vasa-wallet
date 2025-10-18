@@ -30,8 +30,7 @@ function startOfFrame(date: Date, frame: Frame) {
   if (frame === "hour") d.setMinutes(0, 0, 0);
   if (frame === "day") d.setHours(0, 0, 0, 0);
   if (frame === "week") {
-    // ISO week: Monday start
-    const day = (d.getDay() + 6) % 7; // 0..6 (Mon..Sun)
+    const day = (d.getDay() + 6) % 7; // 0..6 (Mon..Sun) -> Monday start
     d.setDate(d.getDate() - day);
     d.setHours(0, 0, 0, 0);
   }
@@ -75,18 +74,14 @@ function round2(n: number) {
 // Group transactions into frames and compute cumulative balance per bucket
 function buildSeries(txs: Tx[], frame: Frame) {
   if (txs.length === 0) return [] as { ts: number; balance: number }[];
-
-  // sort by time asc
   const sorted = [...txs].sort((a, b) => a.ts - b.ts);
 
-  // Map bucket start timestamp -> sum of amounts in that bucket
   const bucket = new Map<number, number>();
   for (const t of sorted) {
     const key = startOfFrame(new Date(t.ts), frame).getTime();
     bucket.set(key, (bucket.get(key) ?? 0) + t.amount);
   }
 
-  // Build cumulative series from earliest bucket to latest, filling gaps
   const keys = [...bucket.keys()].sort((a, b) => a - b);
   if (keys.length === 0) return [];
 
@@ -94,22 +89,17 @@ function buildSeries(txs: Tx[], frame: Frame) {
   let cursor = keys[0];
   const end = startOfFrame(new Date(), frame).getTime();
   let accum = 0;
-  let safety = 0; // avoid infinite loops if clocks are weird
+  let safety = 0;
 
   while (cursor <= end && safety < 100000) {
     accum = round2(accum + (bucket.get(cursor) ?? 0));
     series.push({ ts: cursor, balance: accum });
 
-    // advance cursor by frame
     const c = new Date(cursor);
     if (frame === "month") c.setMonth(c.getMonth() + 1);
     else if (frame === "year") c.setFullYear(c.getFullYear() + 1);
     else
-      cursor +=
-        frame === "hour" ? 3600_000 :
-        frame === "day" ? 86_400_000 :
-        frame === "week" ? 7 * 86_400_000 :
-        30 * 86_400_000; // month fallback (unused here)
+      cursor += frame === "hour" ? 3600_000 : frame === "day" ? 86_400_000 : frame === "week" ? 7 * 86_400_000 : 30 * 86_400_000;
     if (frame === "month" || frame === "year") cursor = c.getTime();
     safety++;
   }
@@ -121,24 +111,31 @@ function buildSeries(txs: Tx[], frame: Frame) {
 async function loadTxServer(): Promise<Tx[]> {
   try {
     const res = await fetch("/api/tx", { cache: "no-store" });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      console.warn("GET /api/tx not ok:", res.status);
+      return [];
+    }
     const json = await res.json();
     const arr = Array.isArray(json?.tx) ? json.tx : [];
     return arr.filter(isTx);
-  } catch {
+  } catch (e) {
+    console.warn("GET /api/tx failed:", e);
     return [];
   }
 }
 
 async function saveTxServer(list: Tx[]) {
   try {
-    await fetch("/api/tx", {
+    const res = await fetch("/api/tx", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ tx: list }),
     });
-  } catch {
-    // noop – můžeš sem dát toast
+    if (!res.ok) {
+      console.warn("POST /api/tx not ok:", res.status, await res.text());
+    }
+  } catch (e) {
+    console.warn("POST /api/tx failed:", e);
   }
 }
 
@@ -148,43 +145,54 @@ export default function FinanceTracker() {
   const [amount, setAmount] = useState<string>("");
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  // Stráž proti přepsání serveru prázdným polem
+  // Stráže/debounce
   const loadedRef = useRef(false);
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // load once from server
+  // Načtení ze serveru
   useEffect(() => {
     loadTxServer().then((data) => {
       setTx(data);
-      loadedRef.current = true; // až teď povolíme ukládání
+      loadedRef.current = true;
     });
   }, []);
 
-  // save to server whenever tx changes (debounced)
+  // Debounced ukládání (po změně tx)
   useEffect(() => {
-    if (!loadedRef.current) return; // neukládej, dokud nejsme po načtení
-    const id = setTimeout(() => {
-      saveTxServer(tx).catch((e) => {
-        // eslint-disable-next-line no-console
-        console.warn("saveTxServer failed", e);
-      });
-    }, 250); // debounce
-    return () => clearTimeout(id);
+    if (!loadedRef.current) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      saveTxServer(tx);
+    }, 250);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
   }, [tx]);
 
   const balance = useMemo(() => round2(tx.reduce((a, b) => a + b.amount, 0)), [tx]);
   const series = useMemo(() => buildSeries(tx, frame), [tx, frame]);
 
+  // Okamžitý zápis při akci (aby se nezahladilo refreshí)
   function addTransaction(sign: 1 | -1) {
     const val = parseFloat(amount.replace(",", "."));
     if (!Number.isFinite(val) || val === 0) return;
     const newTx: Tx = { id: uid(), amount: round2(sign * val), ts: Date.now() };
-    setTx((prev) => [...prev, newTx]);
+    setTx((prev) => {
+      const next = [...prev, newTx];
+      if (loadedRef.current) saveTxServer(next);
+      return next;
+    });
     setAmount("");
     inputRef.current?.focus();
   }
 
   function resetAll() {
-    if (confirm("Smazat všechny položky?")) setTx([]);
+    if (!confirm("Smazat všechny položky?")) return;
+    setTx(() => {
+      const next: Tx[] = [];
+      if (loadedRef.current) saveTxServer(next);
+      return next;
+    });
   }
 
   function exportJson() {
@@ -206,7 +214,10 @@ export default function FinanceTracker() {
         const parsed = JSON.parse(String(reader.result)) as unknown;
         if (!Array.isArray(parsed)) throw new Error("Invalid file");
         const cleaned = parsed.filter(isTx);
-        setTx(cleaned);
+        setTx(() => {
+          if (loadedRef.current) saveTxServer(cleaned);
+          return cleaned;
+        });
       } catch {
         alert("Soubor není platný JSON export.");
       }
@@ -330,7 +341,7 @@ export default function FinanceTracker() {
               </button>
               <button
                 onClick={() => addTransaction(-1)}
-                className="rounded-XL bg-rose-600 px-5 py-3 font-medium text-white shadow hover:brightness-105 active:scale-[.99]"
+                className="rounded-xl bg-rose-600 px-5 py-3 font-medium text-white shadow hover:brightness-105 active:scale-[.99]"
               >
                 − Odečíst
               </button>
